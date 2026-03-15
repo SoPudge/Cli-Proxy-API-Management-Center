@@ -48,6 +48,7 @@ export interface UsageDetail {
     total_tokens: number;
   };
   failed: boolean;
+  thinking_level?: string;
   __modelName?: string;
   __timestampMs?: number;
 }
@@ -110,25 +111,60 @@ const toUsageSummaryFields = (summary: UsageSummary) => ({
   total_tokens: summary.totalTokens
 });
 
-export function filterUsageByTimeRange<T>(usageData: T, range: UsageTimeRange, nowMs: number = Date.now()): T {
-  if (range === 'all') {
-    return usageData;
+const normalizeUsageSourceWithCache = (value: unknown, sourceCache: Map<string, string>): string => {
+  const raw =
+    typeof value === 'string'
+      ? value
+      : value === null || value === undefined
+        ? ''
+        : String(value);
+  const trimmed = raw.trim();
+  if (!trimmed) return '';
+  const cached = sourceCache.get(trimmed);
+  if (cached !== undefined) return cached;
+  const normalized = normalizeUsageSourceId(trimmed);
+  sourceCache.set(trimmed, normalized);
+  return normalized;
+};
+
+const buildUsageDetail = (
+  detailRecord: Record<string, unknown>,
+  modelName: string,
+  sourceCache: Map<string, string>
+): UsageDetail | null => {
+  if (typeof detailRecord.timestamp !== 'string') {
+    return null;
   }
 
+  const timestamp = detailRecord.timestamp;
+  const timestampMs = Date.parse(timestamp);
+  const tokensRaw = isRecord(detailRecord.tokens) ? detailRecord.tokens : {};
+
+  const rawThinkingLevel =
+    typeof detailRecord.thinking_level === 'string' ? detailRecord.thinking_level.trim() : undefined;
+
+  return {
+    timestamp,
+    source: normalizeUsageSourceWithCache(detailRecord.source, sourceCache),
+    auth_index: detailRecord.auth_index as unknown as number,
+    tokens: tokensRaw as unknown as UsageDetail['tokens'],
+    failed: detailRecord.failed === true,
+    thinking_level: rawThinkingLevel || undefined,
+    __modelName: modelName,
+    __timestampMs: Number.isNaN(timestampMs) ? 0 : timestampMs,
+  };
+};
+
+export function filterUsageByDetail<T>(usageData: T, predicate: (detail: UsageDetail) => boolean): T {
   const usageRecord = isRecord(usageData) ? usageData : null;
   const apis = getApisRecord(usageData);
   if (!usageRecord || !apis) {
     return usageData;
   }
 
-  const rangeMs = USAGE_TIME_RANGE_MS[range];
-  if (!Number.isFinite(rangeMs) || rangeMs <= 0) {
-    return usageData;
-  }
-
-  const windowStart = nowMs - rangeMs;
   const filteredApis: Record<string, unknown> = {};
   const totalSummary = createUsageSummary();
+  const sourceCache = new Map<string, string>();
 
   Object.entries(apis).forEach(([apiName, apiEntry]) => {
     if (!isRecord(apiEntry)) {
@@ -155,17 +191,18 @@ export function filterUsageByTimeRange<T>(usageData: T, range: UsageTimeRange, n
 
       detailsRaw.forEach((detail) => {
         const detailRecord = isRecord(detail) ? detail : null;
-        if (!detailRecord || typeof detailRecord.timestamp !== 'string') {
-          return;
-        }
-        const timestamp = Date.parse(detailRecord.timestamp);
-        if (Number.isNaN(timestamp) || timestamp < windowStart || timestamp > nowMs) {
+        if (!detailRecord) {
           return;
         }
 
-        filteredDetails.push(detail);
+        const usageDetail = buildUsageDetail(detailRecord, modelName, sourceCache);
+        if (!usageDetail || !predicate(usageDetail)) {
+          return;
+        }
+
+        filteredDetails.push({ ...detailRecord, ...usageDetail });
         modelSummary.totalRequests += 1;
-        if (detailRecord.failed === true) {
+        if (usageDetail.failed) {
           modelSummary.failureCount += 1;
         } else {
           modelSummary.successCount += 1;
@@ -211,6 +248,23 @@ export function filterUsageByTimeRange<T>(usageData: T, range: UsageTimeRange, n
     ...toUsageSummaryFields(totalSummary),
     apis: filteredApis
   } as T;
+}
+
+export function filterUsageByTimeRange<T>(usageData: T, range: UsageTimeRange, nowMs: number = Date.now()): T {
+  if (range === 'all') {
+    return usageData;
+  }
+
+  const rangeMs = USAGE_TIME_RANGE_MS[range];
+  if (!Number.isFinite(rangeMs) || rangeMs <= 0) {
+    return usageData;
+  }
+
+  const windowStart = nowMs - rangeMs;
+  return filterUsageByDetail(usageData, (detail) => {
+    const timestamp = typeof detail.__timestampMs === 'number' ? detail.__timestampMs : Date.parse(detail.timestamp);
+    return Number.isFinite(timestamp) && timestamp >= windowStart && timestamp <= nowMs;
+  });
 }
 
 export const normalizeAuthIndex = (value: unknown) => {
@@ -459,22 +513,6 @@ export function collectUsageDetails(usageData: unknown): UsageDetail[] {
   const details: UsageDetail[] = [];
   const sourceCache = new Map<string, string>();
 
-  const normalizeSource = (value: unknown): string => {
-    const raw =
-      typeof value === 'string'
-        ? value
-        : value === null || value === undefined
-          ? ''
-          : String(value);
-    const trimmed = raw.trim();
-    if (!trimmed) return '';
-    const cached = sourceCache.get(trimmed);
-    if (cached !== undefined) return cached;
-    const normalized = normalizeUsageSourceId(trimmed);
-    sourceCache.set(trimmed, normalized);
-    return normalized;
-  };
-
   Object.values(apis).forEach((apiEntry) => {
     if (!isRecord(apiEntry)) return;
     const modelsRaw = apiEntry.models;
@@ -487,19 +525,11 @@ export function collectUsageDetails(usageData: unknown): UsageDetail[] {
       const modelDetails = Array.isArray(modelDetailsRaw) ? modelDetailsRaw : [];
 
       modelDetails.forEach((detailRaw) => {
-        if (!isRecord(detailRaw) || typeof detailRaw.timestamp !== 'string') return;
-        const timestamp = detailRaw.timestamp;
-        const timestampMs = Date.parse(timestamp);
-        const tokensRaw = isRecord(detailRaw.tokens) ? detailRaw.tokens : {};
-        details.push({
-          timestamp,
-          source: normalizeSource(detailRaw.source),
-          auth_index: detailRaw.auth_index as unknown as number,
-          tokens: tokensRaw as unknown as UsageDetail['tokens'],
-          failed: detailRaw.failed === true,
-          __modelName: modelName,
-          __timestampMs: Number.isNaN(timestampMs) ? 0 : timestampMs,
-        });
+        const detailRecord = isRecord(detailRaw) ? detailRaw : null;
+        if (!detailRecord) return;
+        const detail = buildUsageDetail(detailRecord, modelName, sourceCache);
+        if (!detail) return;
+        details.push(detail);
       });
     });
   });
@@ -526,22 +556,6 @@ export function collectUsageDetailsWithEndpoint(usageData: unknown): UsageDetail
   const details: UsageDetailWithEndpoint[] = [];
   const sourceCache = new Map<string, string>();
 
-  const normalizeSource = (value: unknown): string => {
-    const raw =
-      typeof value === 'string'
-        ? value
-        : value === null || value === undefined
-          ? ''
-          : String(value);
-    const trimmed = raw.trim();
-    if (!trimmed) return '';
-    const cached = sourceCache.get(trimmed);
-    if (cached !== undefined) return cached;
-    const normalized = normalizeUsageSourceId(trimmed);
-    sourceCache.set(trimmed, normalized);
-    return normalized;
-  };
-
   Object.entries(apis).forEach(([endpoint, apiEntry]) => {
     if (!isRecord(apiEntry)) return;
     const modelsRaw = apiEntry.models;
@@ -558,21 +572,16 @@ export function collectUsageDetailsWithEndpoint(usageData: unknown): UsageDetail
       const modelDetails = Array.isArray(modelDetailsRaw) ? modelDetailsRaw : [];
 
       modelDetails.forEach((detailRaw) => {
-        if (!isRecord(detailRaw) || typeof detailRaw.timestamp !== 'string') return;
-        const timestamp = detailRaw.timestamp;
-        const timestampMs = Date.parse(timestamp);
-        const tokensRaw = isRecord(detailRaw.tokens) ? detailRaw.tokens : {};
+        const detailRecord = isRecord(detailRaw) ? detailRaw : null;
+        if (!detailRecord) return;
+        const detail = buildUsageDetail(detailRecord, modelName, sourceCache);
+        if (!detail) return;
         details.push({
-          timestamp,
-          source: normalizeSource(detailRaw.source),
-          auth_index: detailRaw.auth_index as unknown as number,
-          tokens: tokensRaw as unknown as UsageDetail['tokens'],
-          failed: detailRaw.failed === true,
-          __modelName: modelName,
+          ...detail,
           __endpoint: endpoint,
           __endpointMethod: endpointMethod,
           __endpointPath: endpointPath,
-          __timestampMs: Number.isNaN(timestampMs) ? 0 : timestampMs,
+          __timestampMs: detail.__timestampMs ?? 0,
         });
       });
     });
